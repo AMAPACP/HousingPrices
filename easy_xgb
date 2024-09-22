@@ -1,0 +1,57 @@
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import normalize
+from sklearn.metrics import root_mean_squared_error
+import pandas as pd
+from hyperopt import hp, tpe, fmin, STATUS_OK, Trials
+import xgboost as xgb
+import shap
+
+def give_results(hyperparams, data):
+    print(f"The best hyperparams are: {hyperparams}")
+    hyperparams["max_depth"] = int(hyperparams["max_depth"])
+    hyperparams['n_estimators'] = int(hyperparams['n_estimators'])
+    xgb_reg = xgb.XGBRegressor(**hyperparams)
+    xgb_reg.fit(data[0][0], data[0][1])
+    xgb_rmse = root_mean_squared_error(data[1][1], xgb_reg.predict(data[1][0]))
+    print(f'Your final score: {xgb_rmse}')
+
+
+def cull_vars(num_params, data, params):
+    anti_overfitting = {'max_depth': 5, 'eta': 0.1, 'subsample': 0.4, 'gamma': 0.1,
+                        'colsample_bytree': 0.4, 'n_estimators': 2000, 'lambda': 0.5}
+    xgeeb = xgb.XGBRegressor(**anti_overfitting)
+    xgeeb.fit(data[0][0], data[0][1])
+    # Feature Selection
+    explainer = shap.TreeExplainer(xgeeb, data[1][0])
+    shap_vals = explainer(data[1][0])
+    shap_vals = np.array(np.mean(np.absolute(shap_vals.values), axis=0))
+    threshold = np.sort(shap_vals)[num_params]
+    remaining_params = np.array(params)[shap_vals > threshold]
+    return remaining_params
+
+
+def re_tt_split(x, y, x_cols):
+    x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.2)
+    x_train = pd.DataFrame(x_train, columns=x_cols)
+    x_test = pd.DataFrame(x_test, columns=x_cols)
+    return [[x_train, y_train], [x_test, y_test]]
+
+
+def easy_train_test(data, y_col):
+    data_cols = list(data)
+    data_cols.remove(y_col)
+    y = data[[y_col]]
+    x = data[data_cols]
+    return re_tt_split(x=x, y=y, x_cols=data_cols)
+
+def easy_rmse(pipeline, data, message):
+    pipeline.fit(data[0][0], data[0][1])
+    pred_x = pipeline.predict(data[1][0])
+    rf_rmse = root_mean_squared_error(data[1][1], pred_x)
+    print(message + f' RMSE: {rf_rmse}')
+    return np.ravel(np.array(pred_x))
+
+def easy_pred(pipeline, data):
+    pipeline.fit(data[0][0], np.ravel(data[0][1]))
+    return np.ravel(np.array(pipeline.predict(data[1][0])))
