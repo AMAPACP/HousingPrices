@@ -1,0 +1,204 @@
+import numpy as np
+from sklearn.model_selection import train_test_split, KFold, GridSearchCV
+from sklearn.preprocessing import normalize, RobustScaler
+from sklearn.metrics import root_mean_squared_error
+from sklearn.pipeline import make_pipeline
+from sklearn.svm import SVR
+from sklearn.linear_model import RidgeCV, LassoCV, LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+import pandas as pd
+from hyperopt import hp, tpe, fmin, STATUS_OK, Trials
+import xgboost as xgb
+from easy_xgb import give_results, cull_vars, easy_train_test, re_tt_split, easy_rmse, easy_pred
+from scipy.stats import skew, boxcox_normmax
+from scipy.special import boxcox1p
+
+# Import Data
+house = pd.read_csv("train.csv")
+for_later = pd.read_csv('test.csv')
+house_vars = list(house)
+house_vars.remove('SalePrice')
+y_house = np.log(house[['SalePrice']])
+
+# Removing y var from house
+house = house[house_vars]
+
+# Maybe this introduces horrific data leakage. IDK tho
+x_house = pd.concat([house, for_later])
+
+to_remove = ['Alley', 'Utilities', 'LandSlope', 'Condition2', 'RoofMatl', 'Exterior2nd', 'Heating',
+             'PoolQC']
+house_vars = list(set(house_vars) - set(to_remove))
+# Replacing ordered categorical variables with numbers
+house.replace({'Y': 1, 'N': 0, 'Sev': 2, 'Mod': 1, 'Gtl': 0,
+               'Ex': 5, 'Gd': 4, 'TA': 3, 'Fa': 2, 'Po': 1, 'Lvl': 1, 'Bnk': 0, 'HLS': 0,
+               'Low': 0, 'Grvl': 1, 'Pave': 0, 'A': 1, 'C': 1, 'FV': 0, 'I': 1,
+               'RH': 0, 'RL': 0, 'RP': 0, 'RM': 0, 'Reg': 0, 'IR1': 1, 'IR2': 2, 'IR3': 3,
+               '1Fam': 1, '2fmCon': 2, 'Duplx': 2, 'TwnhsE': 3, 'TwnhsI': 3,
+               '2FmCon': 2, 'C (all)': 1, 'Duplex': 2, 'Twnhs': 3}, inplace=True)
+
+# Separate x from y variables
+x_house = x_house[house_vars]
+col_types = np.array(x_house.dtypes)
+
+# Fill na with the column mean
+num_vars = np.array(list(x_house))[(col_types == np.dtype('int64')) | (col_types == np.dtype('float64'))]
+has_nan = np.array(list(x_house))[np.array(pd.isna(x_house).sum()) != 0]
+num_nan = np.array(list(x_house[num_vars]))[np.array(pd.isna(x_house[num_vars]).sum()) != 0]
+# Introduces small data leakage but I'll live
+col_means = x_house[num_nan].mean()
+# Below is dict used to fill na values
+na_dict = {k: v for (k, v) in zip(num_nan, col_means)}
+x_house.loc[:, num_nan] = x_house[num_nan].fillna(value=na_dict)
+
+# Box Cox transforming high and low skew variables
+skew_cols = np.array(skew(x_house[num_vars]))
+high_skew_cols = num_vars[np.bitwise_or(skew_cols > 0.75, skew_cols < -0.75)]
+# Ugly for loop. Too bad
+for x in high_skew_cols:
+    x_house.loc[:, x] = boxcox1p(x_house[x], boxcox_normmax(x_house[x] + 1.0, method='mle'))
+# Exponential transformation of negatively skewed data
+
+# Encoding dummy variables for remaining categorical variables
+# Encoding here rather than immediately below replacement dict so numbered variable selection works
+cat_vars = [x for x in house_vars if x not in num_vars]
+x_house = pd.get_dummies(x_house, columns=cat_vars, dtype=int)
+house_vars = list(x_house)
+dummy_vars = [x for x in house_vars if x not in num_vars]
+
+# Removing dummy variables that are more than 99.5% 0
+overfit_vars = np.array((x_house[dummy_vars] == 0).astype(int).sum(axis=0) / len(x_house.index) >= 0.995)
+overfit_vars = np.array(dummy_vars)[overfit_vars]
+house_vars = list(set(house_vars) - set(overfit_vars))
+# Evil solution to this problem
+x_house = x_house[house_vars]
+
+x_house = x_house.reindex(sorted(x_house.columns), axis=1)
+
+# Removing the test data from data set
+x_house2 = x_house.loc[x_house['Id'] >= 1461, :]
+x_house = x_house.loc[x_house['Id'] < 1461, :]
+
+# Train test split
+x_train, x_test, y_train, y_test = train_test_split(x_house, y_house, test_size=0.2)
+
+# Add column names back
+x_train = pd.DataFrame(x_train, columns=house_vars)
+x_test = pd.DataFrame(x_test, columns=house_vars)
+# Redefine data in preferred format
+house_data = [[x_train, y_train], [x_test, y_test]]
+
+# Tweaking this model more than I am
+# Defining Hyperparameter space
+xgb_space = {
+    'eta': hp.uniform('eta', 0.0001, 0.3),
+    'max_depth': hp.quniform("max_depth", 1, 5, 1),
+    'gamma': 0,
+    'reg_lambda': 1,
+    'reg_alpha': 0,
+    'colsample_bytree': hp.uniform('colsample_bytree', 0.01, 1),
+    # Not used 'colsample_bylevel': hp.uniform('colsample_bylevel', 0.2, 1),
+    'colsample_bynode': hp.uniform('colsample_bynode', 0.01, 1),
+    'subsample': hp.uniform('subsample', 0.05, 1),
+    'n_estimators': hp.quniform('n_estimators', 200, 5000, 50)
+}
+
+
+def objective(space):
+    # Inputting hyperparameter space
+    clf = xgb.XGBRegressor(
+        eta=space['eta'],
+        n_estimators=int(space['n_estimators']),
+        max_depth=int(space['max_depth']),
+        gamma=0,
+        reg_lambda=1,
+        colsample_bytree=space['colsample_bytree'],
+        colsample_bynode=space['colsample_bynode'],
+        eval_metric="rmse",
+        early_stopping_rounds=200,
+        subsample=space['subsample'],
+        reg_alpha=0
+    )
+    clf.fit(
+        house_data[0][0], house_data[0][1],
+        eval_set=[house_data[1]],
+        verbose=False)
+
+    pred = clf.predict(house_data[1][0])
+    # Defining loss function
+    accuracy = root_mean_squared_error(house_data[1][1], pred)
+    # print(f"MSE: {accuracy}")
+    return {'loss': accuracy, 'status': STATUS_OK}
+
+
+svr = SVR()
+# Currently 30 combinations of
+svr_params = {'C': [1, 5, 20, 50, 100],
+              'epsilon': [1e-06, 1e-05, 1e-04, 1e-3, 1e-2, 0.1],
+              'kernel': ['linear', 'poly', 'rbf', 'sigmoid']}
+svr_grid = GridSearchCV(svr, svr_params, scoring='neg_root_mean_squared_error')
+svr_grid.fit(house_data[0][0], np.ravel(house_data[0][1]))
+print(svr_grid.best_params_)
+svr_pipeline = make_pipeline(RobustScaler(), SVR(**svr_grid.best_params_))
+svr_pred = easy_rmse(svr_pipeline, house_data, 'Support Vector Regression')
+
+rf = make_pipeline(RobustScaler(), RandomForestRegressor(n_estimators=1000, max_features='sqrt'))
+rf_pred = easy_rmse(rf, house_data, "RF Feature Unselected")
+
+trials = Trials()
+best_hyperparams = fmin(fn=objective,
+                        space=xgb_space,
+                        algo=tpe.suggest,
+                        max_evals=100,
+                        trials=trials)
+
+best_hyperparams["max_depth"] = int(best_hyperparams["max_depth"])
+best_hyperparams['n_estimators'] = int(best_hyperparams['n_estimators'])
+xgb_robust = make_pipeline(RobustScaler(), xgb.XGBRegressor(**best_hyperparams))
+xgb_robust_pred = easy_rmse(xgb_robust, house_data, "XGB Feature Unselected")
+
+# __________________________________________________________________________________________________
+
+# Now some more basic models
+ridge_a = (1e-06, 1e-05, 1e-04, 1e-03, 1e-02, 1e-01, 1, 10, 100)
+kfolds = KFold(shuffle=True)
+ridge = make_pipeline(RobustScaler(unit_variance=True), RidgeCV(alphas=ridge_a, cv=kfolds))
+ridge_pred = easy_rmse(ridge, house_data, 'Ridge')
+
+lasso = make_pipeline(RobustScaler(unit_variance=True), LassoCV(alphas=ridge_a, cv=kfolds, max_iter=10000))
+lasso_pred = easy_rmse(lasso, house_data, 'Lasso')
+
+preds = pd.DataFrame(
+    {'lasso': list(lasso_pred),
+        'ridge': list(ridge_pred),
+        'xgb_robust_pred': list(xgb_robust_pred),
+        'rf_pred': list(rf_pred),
+        'svr_pred': list(svr_pred)})
+lr = LinearRegression()
+lr.fit(preds, house_data[1][1])
+
+# Redefine data in preferred format
+test_set_data = [[x_house, y_house], [x_house2]]
+
+ridge = make_pipeline(RobustScaler(unit_variance=True), RidgeCV(alphas=ridge_a, cv=kfolds))
+lasso = make_pipeline(RobustScaler(unit_variance=True), LassoCV(alphas=ridge_a, cv=kfolds, max_iter=20000))
+
+rf_pred = easy_pred(rf, test_set_data)
+xgb_robust_pred = easy_pred(xgb_robust, test_set_data)
+lasso_pred = easy_pred(lasso, test_set_data)
+ridge_pred = easy_pred(ridge, test_set_data)
+svr_pred = easy_pred(svr_pipeline, test_set_data)
+preds = pd.DataFrame(
+    {'lasso': list(lasso_pred),
+        'ridge': list(ridge_pred),
+        'xgb_robust_pred': list(xgb_robust_pred),
+        'rf_pred': list(rf_pred),
+        'svr_pred': list(svr_pred)})
+ID = np.ravel(np.array(x_house2[['Id']]))
+submission = np.ravel(np.array(lr.predict(preds)))
+submission = np.exp(submission)
+submission = pd.DataFrame({'Id': ID, 'SalePrice': submission})
+submission.sort_values(by='Id')
+submission.to_csv("submission.csv", index=False)
+
+
